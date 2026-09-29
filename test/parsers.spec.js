@@ -19,6 +19,23 @@ function returnReply () { throw new Error('failed') }
 function returnError () { throw new Error('failed') }
 function returnFatalError (err) { throw err }
 
+// Create a reply with `depth` nested arrays around the integer 1
+function createNestedArray (depth) {
+  return new Array(depth + 1).join('*1\r\n') + ':1\r\n'
+}
+
+// Iteratively check a reply created by createNestedArray
+function assertNestedArray (reply, depth) {
+  for (let i = 0; i < depth; i++) {
+    assert(Array.isArray(reply))
+    assert.strictEqual(reply.length, 1)
+    reply = reply[0]
+  }
+  assert.strictEqual(reply, 1)
+}
+
+const nestingErrorMessage = 'Protocol error, array nesting depth exceeds the limit of 1000'
+
 describe('parsers', function () {
   describe('general parser functionality', function () {
     it('fail for missing options argument', function () {
@@ -402,6 +419,138 @@ describe('parsers', function () {
         parser.execute(Buffer.from('*1\r\n+OK\r\n\n+zasd\r\n'))
         assert.strictEqual(replyCount, 1)
         assert.strictEqual(errCount, 1)
+      })
+
+      it('parse nested arrays up to the maximum nesting depth', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        const depths = [1, 100, 1000, 1000]
+        function checkReply (reply) {
+          assertNestedArray(reply, depths[replyCount])
+          replyCount++
+        }
+        const parser = newParser(checkReply)
+        parser.execute(Buffer.from(createNestedArray(1) + createNestedArray(100) + createNestedArray(1000)))
+        assert.strictEqual(replyCount, 3)
+        // The same reply split into small chunks is resumed from the array cache
+        const reply = Buffer.from(createNestedArray(1000))
+        for (let i = 0; i < reply.length; i += 13) {
+          parser.execute(reply.slice(i, i + 13))
+        }
+        assert.strictEqual(replyCount, 4)
+      })
+
+      it('return a fatal error for too deeply nested arrays', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, [[1], 'OK'])
+          replyCount++
+        }
+        function checkError (err) {
+          assert.strictEqual(err.message, nestingErrorMessage)
+          assert(err instanceof ParserError)
+          assert(err.offset)
+          assert(err.buffer)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // This used to exceed the maximum call stack size
+        parser.execute(Buffer.from(createNestedArray(100000)))
+        assert.strictEqual(errCount, 1)
+        parser.execute(Buffer.from(createNestedArray(1001)))
+        assert.strictEqual(errCount, 2)
+        assert.strictEqual(replyCount, 0)
+        // The parser is reset and parses following replies properly
+        parser.execute(Buffer.from('*2\r\n*1\r\n:1\r\n+OK\r\n'))
+        assert.strictEqual(replyCount, 1)
+      })
+
+      it('return a fatal error for too deeply nested arrays received in chunks', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, [[1], 'OK'])
+          replyCount++
+        }
+        function checkError (err) {
+          assert.strictEqual(err.message, nestingErrorMessage)
+          assert(err instanceof ParserError)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // Each chunk contains the maximum nesting depth. Every second chunk
+        // exceeds the limit while resuming the cached arrays of the previous one
+        const chunk = Buffer.from(new Array(1001).join('*1\r\n'))
+        for (let i = 0; i < 40; i++) {
+          parser.execute(chunk)
+        }
+        assert.strictEqual(errCount, 20)
+        assert.strictEqual(replyCount, 0)
+        // The parser is reset and parses following replies properly
+        parser.execute(Buffer.from('*2\r\n*1\r\n:1'))
+        parser.execute(Buffer.from('\r\n+OK\r\n'))
+        assert.strictEqual(replyCount, 1)
+      })
+
+      it('reset the nesting depth if returnFatalError throws', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        function checkReply (reply) {
+          assertNestedArray(reply, 1000)
+          replyCount++
+        }
+        const parser = newParser(checkReply)
+        assert.throws(function () {
+          parser.execute(Buffer.from(createNestedArray(1001)))
+        }, function (err) {
+          assert.strictEqual(err.message, nestingErrorMessage)
+          assert(err instanceof ParserError)
+          return true
+        })
+        parser.execute(Buffer.from(createNestedArray(1000)))
+        assert.strictEqual(replyCount, 1)
+      })
+
+      it('parser errors in nested arrays do not leave partial arrays cached', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, [[1]])
+          replyCount++
+        }
+        function checkError (err) {
+          assert.strictEqual(err.message, 'Protocol error, got "b" as reply type byte')
+          assert(err instanceof ParserError)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // Cached partial arrays would add up and later be resumed recursively
+        const faulty = Buffer.from(new Array(1000).join('*1\r\n') + 'b')
+        for (let i = 0; i < 50; i++) {
+          parser.execute(faulty)
+        }
+        assert.strictEqual(errCount, 50)
+        parser.execute(Buffer.from('*1\r\n*1\r\n'))
+        parser.execute(Buffer.from(':1\r\n'))
+        assert.strictEqual(replyCount, 1)
       })
 
       it('should handle \\r and \\n characters properly', function () {
