@@ -1,0 +1,24 @@
+name: seal-build
+on:
+  workflow_dispatch: {}
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '7.10.0'
+      - name: Show toolchain
+        run: node --version && npm --version
+      - name: Pack the npm tarball
+        run: |
+          rm -rf .github
+          npm pack
+          tar tzvf redis-parser-3.0.0.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redis-parser-tgz
+          path: redis-parser-3.0.0.tgz
+          if-no-files-found: error
