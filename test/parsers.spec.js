@@ -35,6 +35,7 @@ function assertNestedArray (reply, depth) {
 }
 
 const nestingErrorMessage = 'Protocol error, array nesting depth exceeds the limit of 1000'
+const arrayLengthErrorMessage = 'Protocol error, array length exceeds the limit of 4294967295'
 
 describe('parsers', function () {
   describe('general parser functionality', function () {
@@ -550,6 +551,103 @@ describe('parsers', function () {
         assert.strictEqual(errCount, 50)
         parser.execute(Buffer.from('*1\r\n*1\r\n'))
         parser.execute(Buffer.from(':1\r\n'))
+        assert.strictEqual(replyCount, 1)
+      })
+
+      it('return a fatal error for array lengths exceeding the maximum array length', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        const results = ['OK', [[1], 'OK']]
+        function checkReply (reply) {
+          assert.deepEqual(reply, results[replyCount])
+          replyCount++
+        }
+        function checkError (err) {
+          assert.strictEqual(err.message, arrayLengthErrorMessage)
+          assert(err instanceof ParserError)
+          assert(err.offset)
+          assert(err.buffer)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // These used to throw an uncaught "RangeError: Invalid array length"
+        parser.execute(Buffer.from('*4294967296\r\n'))
+        assert.strictEqual(errCount, 1)
+        parser.execute(Buffer.from('*1\r\n*99999999999\r\n'))
+        assert.strictEqual(errCount, 2)
+        // Lengths that overflow to Infinity and malformed length bytes
+        parser.execute(Buffer.from('*' + new Array(401).join('9') + '\r\n'))
+        assert.strictEqual(errCount, 3)
+        parser.execute(Buffer.from('*zzzzzzzzzz\r\n'))
+        assert.strictEqual(errCount, 4)
+        assert.strictEqual(replyCount, 0)
+        // The parser is reset and parses following replies properly
+        parser.execute(Buffer.from('+OK\r\n'))
+        assert.strictEqual(replyCount, 1)
+        parser.execute(Buffer.from('*2\r\n*1\r\n:1\r\n+OK\r\n'))
+        assert.strictEqual(replyCount, 2)
+      })
+
+      it('return a fatal error for array lengths exceeding the maximum array length received in chunks', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, [[1], 'OK'])
+          replyCount++
+        }
+        function checkError (err) {
+          assert.strictEqual(err.message, arrayLengthErrorMessage)
+          assert(err instanceof ParserError)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // The length header itself is split into two chunks
+        parser.execute(Buffer.from('*4294'))
+        parser.execute(Buffer.from('967296\r\n'))
+        assert.strictEqual(errCount, 1)
+        // The length is parsed while resuming a cached array
+        parser.execute(Buffer.from('*2\r\n:1\r\n'))
+        parser.execute(Buffer.from('*4294967296\r\n'))
+        assert.strictEqual(errCount, 2)
+        // The length is parsed while resuming multiple nested cached arrays
+        parser.execute(Buffer.from('*1\r\n*2\r\n:1\r\n'))
+        parser.execute(Buffer.from('*4294967296\r\n'))
+        assert.strictEqual(errCount, 3)
+        assert.strictEqual(replyCount, 0)
+        // No partial arrays are left cached and following replies are parsed properly
+        parser.execute(Buffer.from('*2\r\n*1\r\n:1'))
+        parser.execute(Buffer.from('\r\n+OK\r\n'))
+        assert.strictEqual(replyCount, 1)
+      })
+
+      it('return a ParserError instead of a RangeError for too long arrays if returnFatalError throws', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        function checkReply (reply) {
+          assert.strictEqual(reply, 'OK')
+          replyCount++
+        }
+        const parser = newParser(checkReply)
+        assert.throws(function () {
+          parser.execute(Buffer.from('*1\r\n*4294967296\r\n'))
+        }, function (err) {
+          assert.strictEqual(err.message, arrayLengthErrorMessage)
+          assert(err instanceof ParserError)
+          assert(!(err instanceof RangeError))
+          return true
+        })
+        parser.execute(Buffer.from('+OK\r\n'))
         assert.strictEqual(replyCount, 1)
       })
 
